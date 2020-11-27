@@ -49,9 +49,6 @@ longData_new <- msprep(data = new_data, trans = tmat_new,
 expandedData_new <- expand.covs(longData_new, covs_new, longnames=FALSE)
 
 em <- function(lognu = c(0,0,0), last=FALSE) {
-  # calculates observed data log-likelihood with EM algorithm,
-  # if last=True returns final models instead of log-lik
-  # set up constant values valid for all hospitals
   print(exp(lognu))
   nu0 <- exp(lognu[1])
   nu1 <- exp(lognu[2])
