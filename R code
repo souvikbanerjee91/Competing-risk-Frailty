@@ -1,0 +1,420 @@
+library(survival)
+library(mstate)
+library(numDeriv)
+library(dynpred)
+library(plyr)
+library(rowr)
+library(pROC)
+library(Hmisc) # for cut2 function
+library(cmprsk)
+library(survAUC)
+library(gtools)
+library(coxme)
+library(survminer)
+
+new_data=read.csv("mdata.csv",header=TRUE)
+
+new_data$tstage<-factor(new_data$tstage)
+new_data$nstage<-factor(new_data$nstage)
+new_data$mstage<-factor(new_data$mstage)
+
+### CIF plot #####
+
+fit1=survfit(Surv(time, status,type="mstate")~1, data=new_data)
+ggcompetingrisks(fit1, palette = "jco", legend = "top", ggtheme = theme_bw())
+
+### Individual Analysis ####
+
+Cox1<-coxph(Surv(time, status==1)~ age + tstage + nstage + mstage , data = new_data)
+Cox2<-coxph(Surv(time, status==2)~ age + tstage + nstage + mstage , data = new_data)
+
+### Competing Risk Model #####
+frail_variance=c()
+output1=NULL
+cuts=seq(min(new_data$HER2), max(new_data$HER2), len=100)
+xcuts=cuts[-c(which.min(cuts),which.max(cuts))]
+for(s in 10:(length(xcuts)-10))
+{
+  frailtycat=ifelse(new_data$HER2<xcuts[s],1,2)
+  new_data$HER2frailty=frailtycat
+
+### Competing Risk Analysis ####
+tmat_new <- transMat(x=list(c(2, 3), c(), c()),
+                     names=c("Censored", "DM","CR"))
+covs_new=c("age", "tstage", "nstage","mstage","HER2frailty")
+longData_new <- msprep(data = new_data, trans = tmat_new,
+                       time = c(NA, "time","time"),
+                       status = c(NA, "DM", "CR"),
+                       keep = covs_new)
+expandedData_new <- expand.covs(longData_new, covs_new, longnames=FALSE)
+
+em <- function(lognu = c(0,0,0), last=FALSE) {
+  # calculates observed data log-likelihood with EM algorithm,
+  # if last=True returns final models instead of log-lik
+  # set up constant values valid for all hospitals
+  print(exp(lognu))
+  nu0 <- exp(lognu[1])
+  nu1 <- exp(lognu[2])
+  nu2 <- exp(lognu[3])
+  stand1 <- 1/(nu0 + nu1)
+  stand2 <- 1/(nu0 + nu2)
+  log.stand1 <- log(stand1)
+  log.stand2 <- log(stand2)
+  HER2frailty <- unique(new_data$HER2frailty)
+  K <- length(HER2frailty)
+  X <- as.matrix(expandedData_new[expandedData_new$trans==1,
+                                  c("age.1", "tstage1.1","tstage2.1","tstage3.1",
+                                    "nstage1.1","nstage2.1","nstage3.1","nstage4.1",
+                                    "mstage1.1","mstage2.1","mstage3.1")]) 
+  eventtimes1 <- sort(unique(longData_new$time[longData_new$trans == 1 &
+                                                 longData_new$status == 1]))
+  eventtimes2 <- sort(unique(longData_new$time[longData_new$trans == 2 &
+                                                 longData_new$status == 1]))
+  # set up constant values for each hospital
+  datak1 <- datak2<- dk1 <- dk2 <-
+    l <- m <- a1 <- a2 <- a3 <- wh1 <-
+    wh2 <- xk<- tk1 <- tk2 <- vector('list', K)
+  for(i in 1:K){
+    datak <- longData_new[longData_new$HER2frailty == HER2frailty[i],]
+    datak1[[i]] <- datak[datak$trans == 1,]
+    datak2[[i]] <- datak[datak$trans == 2,]
+    dk1[[i]] <- sum(datak1[[i]]$status)
+    dk2[[i]] <- sum(datak2[[i]]$status)
+    xk[[i]] <- X[new_data$HER2frailty == HER2frailty[i],]
+        
+    l[[i]]<-m[[i]]<-array(0,dim = c(dk1[[i]] + 1, dk2[[i]] + 1))
+    l[[i]]<-slice.index(l[[i]],1)-1
+    m[[i]]<-slice.index(m[[i]],2)-1
+    
+    a1[[i]] <- l[[i]] + nu1
+    a2[[i]] <- m[[i]] + nu2
+    a3[[i]] <- dk1[[i]] + dk2[[i]] + nu0 - l[[i]] - m[[i]]
+    wh1[[i]] <- which(datak1[[i]]$status == 1)
+    wh2[[i]] <- which(datak2[[i]]$status == 1)
+    
+    tk1[[i]] <- match(datak1[[i]]$time[wh1[[i]]], eventtimes1)
+    tk2[[i]] <- match(datak2[[i]]$time[wh2[[i]]], eventtimes2)
+  }
+  obslik <- numeric(5)
+  models <- vector('list', 5)
+  for(j in 1:5){
+    print(j)
+    # set up starting parameters for EM (5 times)####
+    Zk0 <- exp(rnorm(K, lognu[1]-0.5,1))
+    Zk1 <- exp(rnorm(K, lognu[2]-0.5,1))
+    Zk2 <- exp(rnorm(K, lognu[3]-0.5,1))
+    longData_new$zk0 <- Zk0[match(longData_new$HER2frailty, HER2frailty)]
+    longData_new$zk1 <- Zk1[match(longData_new$HER2frailty, HER2frailty)]
+    longData_new$zk2 <- Zk2[match(longData_new$HER2frailty, HER2frailty)]
+    m.cause1 <- coxph(Surv(time, status)~ age + tstage + nstage + mstage+
+                        offset(log((zk0 + zk1)*stand1)),
+                      data = longData_new, subset = (trans == 1))
+    m.cause2 <- coxph(Surv(time, status)~ age + tstage + nstage + mstage+
+                        offset(log((zk0 + zk2)*stand2)),
+                      data = longData_new, subset = (trans == 2))
+    Lambda1 <- basehaz(m.cause1, centered=FALSE)
+    Lambda1 <- Lambda1[!duplicated(Lambda1$hazard),]
+    Lambda1 <- Lambda1[Lambda1$hazard != 0,]
+    Lambda2 <- basehaz(m.cause2, centered = FALSE)
+    Lambda2 <- Lambda2[!duplicated(Lambda2$hazard),]
+    Lambda2 <- Lambda2[Lambda2$hazard != 0,]
+    
+    lambda1 <- diff(c(0, Lambda1$hazard))
+    lambda2 <- diff(c(0, Lambda2$hazard))
+    beta1 <- m.cause1$coef
+    beta2 <- m.cause2$coef
+    loglik.old <- 1
+    obs <- numeric(K)
+    repeat{
+      for(i in 1:K){
+        # E-step for hospital k ####
+        H10time <- evalstep(Lambda1$time, Lambda1$hazard,
+                            newtime = datak1[[i]]$time, subst=0)
+        H20time <- evalstep(Lambda2$time, Lambda2$hazard,
+                            newtime = datak2[[i]]$time, subst=0)
+        
+        hr1 <- exp(xk[[i]]%*%beta1); hr2 <- exp(xk[[i]]%*%beta2)
+        st.Lambdak1 <- stand1*sum(H10time*hr1)
+        st.Lambdak2 <- stand2*sum(H20time*hr2)
+        b1 <- 1 + st.Lambdak1; b2 <- 1 + st.Lambdak2; 
+        b3 <- b1 + b2 - 1
+        tmp <- lchoose(dk1[[i]], l[[i]]) + lchoose(dk2[[i]], m[[i]]) + 
+          (lgamma(a1[[i]]) - a1[[i]]*log(b1)) +
+          (lgamma(a2[[i]]) - a2[[i]]*log(b2)) +
+          (lgamma(a3[[i]]) - a3[[i]]*log(b3)) 
+          
+        maxtmp <- max(tmp)
+        tmp <- tmp - maxtmp
+        mat <- exp(tmp)
+        clm <- mat/sum(mat)
+        Zk0[i] <- sum(clm*(a3[[i]]/b3))
+        Zk1[i] <- sum(clm*(a1[[i]]/b1))
+        Zk2[i] <- sum(clm*(a2[[i]]/b2))
+        # likelihood contribution of hospital k ####
+        obs[i] <- (dk1[[i]]*log.stand1 + dk2[[i]]*log.stand2 -
+                     lgamma(nu0) - lgamma(nu1) - lgamma(nu2)) +
+          sum(log(lambda1[tk1[[i]]]*hr1[wh1[[i]]])) +
+          sum(log(lambda2[tk2[[i]]]*hr2[wh2[[i]]])) +
+          log(sum(mat)) + maxtmp
+      }
+      loglik <- sum(obs)
+      delta <- loglik.old - loglik
+      cat(s,"Log-lik =", loglik, ", delta =", delta, "\n")
+      if(abs(delta) < 1e-4) break
+      loglik.old <- loglik
+      # M-step ####
+      longData_new$zk0 <- Zk0[match(longData_new$HER2frailty, HER2frailty)]
+      longData_new$zk1 <- Zk1[match(longData_new$HER2frailty, HER2frailty)]
+      longData_new$zk2 <- Zk2[match(longData_new$HER2frailty, HER2frailty)]
+      m.cause1 <- coxph(Surv(time, status)~ age + tstage + nstage + mstage+
+                          offset(log((zk0 + zk1)*stand1)),
+                        data = longData_new, subset = (trans == 1))
+      m.cause2 <- coxph(Surv(time, status)~ age + tstage + nstage +mstage+
+                          offset(log((zk0 + zk2)*stand2)),
+                        data = longData_new, subset = (trans == 2))
+      Lambda1 <- basehaz(m.cause1, centered = FALSE)
+      Lambda1 <- Lambda1[!duplicated(Lambda1$hazard),]
+      Lambda1 <- Lambda1[Lambda1$hazard != 0,]
+      Lambda2 <- basehaz(m.cause2, centered = FALSE)
+      Lambda2 <- Lambda2[!duplicated(Lambda2$hazard),]
+      Lambda2 <- Lambda2[Lambda2$hazard != 0,]
+      
+      lambda1 <- diff(c(0, Lambda1$hazard))
+      lambda2 <- diff(c(0, Lambda2$hazard))
+      beta1 <- m.cause1$coef
+      beta2 <- m.cause2$coef
+    }
+    obslik[j] <- loglik
+    models[[j]] <- list(m.cause1 = m.cause1, m.cause2 = m.cause2)
+  }
+  m.index <- which.max(obslik)
+  ifelse(last == FALSE, return(obslik[m.index]),
+         return(c(models[[m.index]], longData_new)))
+}
+
+param <- function(lognu){
+  # returns frailty variances and correlation ####
+  nu <- exp(lognu)
+  nu0<- nu[1]
+  nu1<- nu[2]
+  nu2<- nu[3]
+  var1<-1/(nu0+nu1)
+  var2<-1/(nu0+nu2)
+  corr1<-nu0*sqrt(var1*var2)
+  return(list(nu=nu,var1=var1,var2=var2,corr1=corr1))
+}
+
+u1=sample(1000:5000,1,replace = FALSE)
+set.seed(u1)
+opt <- optim(par = c(0,0,0), fn = em, 
+             control = list(fnscale = -1), lower=c(-20, -20, -20 ), upper= c(20,20,20),
+             method = "L-BFGS-B", hessian = TRUE)
+u1=sample(1000:5000,1,replace = FALSE)
+set.seed(u1)
+lognu <- opt$par
+final <- em(lognu, last = TRUE)
+m.cause1 <- final$m.cause1
+m.cause2 <- final$m.cause2
+
+eta <- 
+  # Returns regression parameters from 
+  # m, which is em(..., last=TRUE) output.
+  function(m) {  
+    n <- length(m$m.cause1$coef)
+    if(n>0){
+      Lambda1 <- basehaz(m$m.cause1, centered=FALSE)
+      Lambda2 <- basehaz(m$m.cause2, centered = FALSE)
+    }else{
+      Lambda1 <- basehaz(m$m.cause1)
+      Lambda2 <- basehaz(m$m.cause2)
+    }
+    Lambda1 <- Lambda1[!duplicated(Lambda1$hazard),]
+    Lambda1 <- Lambda1[Lambda1$hazard != 0,]
+    Lambda2 <- Lambda2[!duplicated(Lambda2$hazard),]
+    Lambda2 <- Lambda2[Lambda2$hazard != 0,]
+    
+    lambda1 <- diff(c(0, Lambda1$hazard))
+    lambda2 <- diff(c(0, Lambda2$hazard))
+    beta1 <- m$m.cause1$coef
+    beta2 <- m$m.cause2$coef
+    return(c(beta1, beta2, lambda1, lambda2))
+  }
+
+# Confidence intervals
+p <- param(lognu)
+
+output1<-c(p$var1,p$var2,p$corr1)
+frail_variance=rbind(frail_variance,output1)
+}
+colnames(frail_variance)=c("var1","var2","corr1")
+
+### p-value for each biomarker ####
+HER2pvalue=data.frame()
+cuts=seq(min(new_data$HER2), max(new_data$HER2), len=100)
+xcuts=cuts[-c(which.min(cuts),which.max(cuts))]
+
+for(s in 1:(length(xcuts)))
+{
+  frailtycat=ifelse(new_data$HER2<xcuts[s],0,1)
+  new_data$HER2frailty=frailtycat
+  new_data$HER2frailty=as.factor(new_data$HER2frailty)
+  coxp <- coxph(Surv(time, status==1)~ age + tstage + nstage + mstage + HER2frailty,
+                    data = new_data)
+  coxq <- coxph(Surv(time, status==2)~ age + tstage + nstage + mstage + HER2frailty,
+                data = new_data)
+  pvalue=c(s,xcuts[s],as.numeric(coef(coxp)[12]),as.numeric(coef(summary(coxp))[,"Pr(>|z|)"][12]),as.numeric(coef(coxq)[12]),as.numeric(coef(summary(coxq))[,"Pr(>|z|)"][12]))
+  HER2pvalue=rbind(HER2pvalue,pvalue)
+}  
+colnames(HER2pvalue)=c("cutpoint",”cutoffvalue”,"coefficient_metas","pvalue_metas","coefficient_death","pvalue_death")
+write.csv(HER2pvalue,"HER2pvalue.csv")
+    
+### correlation between p value and frailty variance ####
+
+HER2frailty=read.csv("HER2frailty.csv",header=T)  ## data file computed from the correlated frailty #model for HER2 biomarker
+HER2pvalue=read.csv("HER2pvalue.csv",header=T) ## datafile consists of p-values
+ERfrailty=read.csv("ERfrailty.csv",header=T)
+ERpvalue=read.csv("ERpvalue.csv",header=T)
+ERBB2frailty=read.csv("ERBB2frailty.csv",header=T)
+ERBB2pvalue=read.csv("ERBB2pvalue.csv",header=T)
+PRfrailty=read.csv("PRfrailty.csv",header=T)
+PRpvalue=read.csv("PRpvalue.csv",header=T)
+
+#Showing only for HER2
+jointdata=merge(HER2frailty,HER2pvalue,by="cutpoint")
+corr_pHER2=cor(jointdata$var1,jointdata$pvalue_metas)
+
+### Cross join of p-values to obtain p-value combiner ####
+HER2p=data.frame(HER2pvalue$cutpoint,HER2pvalue$cutoffvalue,HER2pvalue$pvalue_metas)
+colnames(HER2p)=c("HER2_cutpoint","HER2_cutoffvalue","HER2_meta_p")
+ERBB2p=data.frame(ERBB2pvalue$cutpoint,ERBB2pvalue$cutoffvalue,ERBB2pvalue$pvalue_metas)
+colnames(ERBB2p)=c("ERBB2_cutpoint","ERBB2_cutoffvalue","ERBB2_meta_p")
+ERp=data.frame(ERpvalue$cutpoint,ERpvalue$cutoffvalue,ERpvalue$pvalue_metas)
+colnames(ERp)=c("ER_cutpoint","ER_cutoffvalue","ER_meta_p")
+PRp=data.frame(PRpvalue$cutpoint,PRpvalue$cutoffvalue,PRpvalue$pvalue_metas)
+colnames(PRp)=c("PR_cutpoint","PR_cutoffvalue","PR_meta_p")
+
+jointp=Reduce(merge,list(HER2p,ERBB2p,ERp,PRp)) #will take huge amount of time
+jointp$Fisher_p=rowSums(cbind(log(jointp$HER2_meta_p),log(jointp$ERBB2_meta_p),log(jointp$ER_meta_p),log(jointp$PR_meta_p)))
+jointp$Edgington_p=rowSums(cbind(jointp$HER2_meta_p,jointp$ERBB2_meta_p,jointp$ER_meta_p,jointp$PR_meta_p))
+jointp$Pearson_p=rowSums(cbind(-log(1-jointp$HER2_meta_p),-log(1-jointp$ERBB2_meta_p),-log(1-jointp$ER_meta_p),-log(1-jointp$PR_meta_p)))
+jointp$George_p=rowSums(cbind(jointp$Fisher_p,jointp$Pearson_p))
+jointp$Stouffer_p=rowSums(cbind(qnorm(jointp$HER2_meta_p),qnorm(jointp$ERBB2_meta_p),qnorm(jointp$ER_meta_p),qnorm(jointp$PR_meta_p)))
+
+### finding optimal cutoff by considering all the cutoff values of all 4 genes taking one by one#####
+s=permutations(4,4,c("HER2","ER","PR","ERBB2"))
+final_p=data.frame()
+for(q in 1:dim(s)[1])
+{
+  print(q)
+  ### for cutoff based on percentiles ###
+  assign(paste("cuts",s[q,1],sep="_"),as.numeric(quantile(new_data[,colnames(new_data)==s[q,1]],probs=seq(0,1,0.01))))
+  assign(paste("cuts",s[q,2],sep="_"),as.numeric(quantile(new_data[,colnames(new_data)==s[q,2]],probs=seq(0,1,0.01))))
+  assign(paste("cuts",s[q,3],sep="_"),as.numeric(quantile(new_data[,colnames(new_data)==s[q,3]],probs=seq(0,1,0.01))))
+  assign(paste("cuts",s[q,4],sep="_"),as.numeric(quantile(new_data[,colnames(new_data)==s[q,4]],probs=seq(0,1,0.01))))
+ 
+xcuts_HER2=cuts_HER2[-c(which.min(cuts_HER2),which.max(cuts_HER2))]
+xcuts_ER=cuts_ER[-c(which.min(cuts_ER),which.max(cuts_ER))]
+xcuts_PR=cuts_PR[-c(which.min(cuts_PR),which.max(cuts_PR))]
+xcuts_ERBB2=cuts_ERBB2[-c(which.min(cuts_ERBB2),which.max(cuts_ERBB2))]
+
+coxmod1=data.frame()
+coxmod2=data.frame()
+coxmod3=data.frame()
+coxmod4=data.frame()
+
+### for HER2 #####
+
+assign(paste("cat",s[q,1],sep="_"),ifelse(new_data[,colnames(new_data)==s[q,1]]<eval(parse(text=paste("xcuts",s[q,1],sep="_")))[74],0,1))
+assign(paste("cat",s[q,2],sep="_"),ifelse(new_data[,colnames(new_data)==s[q,2]]<eval(parse(text=paste("xcuts",s[q,2],sep="_")))[74],0,1))
+assign(paste("cat",s[q,3],sep="_"),ifelse(new_data[,colnames(new_data)==s[q,3]]<eval(parse(text=paste("xcuts",s[q,3],sep="_")))[74],0,1))
+new_data[,colnames(new_data)==paste(s[q,1],"frailty",sep="")]=eval(parse(text=paste("cat",s[q,1],sep="_")))
+new_data[,colnames(new_data)==paste(s[q,2],"frailty",sep="")]=eval(parse(text=paste("cat",s[q,2],sep="_")))
+new_data[,colnames(new_data)==paste(s[q,3],"frailty",sep="")]=eval(parse(text=paste("cat",s[q,3],sep="_")))
+
+for(i in 1:length(eval(parse(text=paste("xcuts",s[q,4],sep="_")))))
+  {
+    assign(paste("cat",s[q,4],sep="_"),ifelse(new_data[,colnames(new_data)==s[q,4]]<eval(parse(text=paste("xcuts",s[q,4],sep="_")))[i],0,1))
+    new_data[,colnames(new_data)==paste(s[q,4],"frailty",sep="")]=eval(parse(text=paste("cat",s[q,4],sep="_")))
+    coxmodel <- coxph(Surv(time, status==1)~ age + tstage + nstage + mstage + HER2frailty+ERfrailty
+                  +PRfrailty+ERBB2frailty, data = new_data)
+    d=data.frame(s[q,4],i,eval(parse(text=paste("xcuts",s[q,4],sep="_")))[i], as.numeric(summary(coxmodel)[["coefficients"]][,"Pr(>|z|)"][paste(s[q,4],"frailty",sep="")]))
+    coxmod1=rbind(coxmod1,d)
+  } 
+colnames(coxmod1)=c("gene_name","cutpoint","cutoffvalue","p_value")
+assign(paste("cat",s[q,4],sep="_"),ifelse(new_data[,colnames(new_data)==s[q,4]]<coxmod1[which.min(coxmod1$p_value),]$cutoffvalue,0,1))
+new_data[,colnames(new_data)==paste(s[q,4],"frailty",sep="")]=eval(parse(text=paste("cat",s[q,4],sep="_")))
+
+### for ER #####
+for(j in 1:length(eval(parse(text=paste("xcuts",s[q,3],sep="_")))))
+{
+  assign(paste("cat",s[q,3],sep="_"),ifelse(new_data[,colnames(new_data)==s[q,3]]<eval(parse(text=paste("xcuts",s[q,3],sep="_")))[j],0,1))
+  new_data[,colnames(new_data)==paste(s[q,3],"frailty",sep="")]=eval(parse(text=paste("cat",s[q,3],sep="_")))
+  coxmodel <- coxph(Surv(time, status==1)~ age + tstage + nstage + mstage + HER2frailty+ERfrailty
+                    +PRfrailty+ERBB2frailty, data = new_data)
+  d=data.frame(s[q,3],j,eval(parse(text=paste("xcuts",s[q,3],sep="_")))[j], as.numeric(summary(coxmodel)[["coefficients"]][,"Pr(>|z|)"][paste(s[q,3],"frailty",sep="")]))
+  coxmod2=rbind(coxmod2,d)
+} 
+colnames(coxmod2)=c("gene_name","cutpoint","cutoffvalue","p_value")
+assign(paste("cat",s[q,3],sep="_"),ifelse(new_data[,colnames(new_data)==s[q,3]]<coxmod2[which.min(coxmod2$p_value),]$cutoffvalue,0,1))
+new_data[,colnames(new_data)==paste(s[q,3],"frailty",sep="")]=eval(parse(text=paste("cat",s[q,3],sep="_")))
+
+### For PR #####
+for(k in 1:length(eval(parse(text=paste("xcuts",s[q,2],sep="_")))))
+{
+  assign(paste("cat",s[q,2],sep="_"),ifelse(new_data[,colnames(new_data)==s[q,2]]<eval(parse(text=paste("xcuts",s[q,2],sep="_")))[k],0,1))
+  new_data[,colnames(new_data)==paste(s[q,2],"frailty",sep="")]=eval(parse(text=paste("cat",s[q,2],sep="_")))
+  coxmodel <- coxph(Surv(time, status==1)~ age + tstage + nstage + mstage + HER2frailty+ERfrailty
+                    +PRfrailty+ERBB2frailty, data = new_data)
+  d=data.frame(s[q,2],k,eval(parse(text=paste("xcuts",s[q,2],sep="_")))[k], as.numeric(summary(coxmodel)[["coefficients"]][,"Pr(>|z|)"][paste(s[q,2],"frailty",sep="")]))
+  coxmod3=rbind(coxmod3,d)
+} 
+colnames(coxmod3)=c("gene_name","cutpoint","cutoffvalue","p_value")
+assign(paste("cat",s[q,2],sep="_"),ifelse(new_data[,colnames(new_data)==s[q,2]]<coxmod3[which.min(coxmod3$p_value),]$cutoffvalue,0,1))
+new_data[,colnames(new_data)==paste(s[q,2],"frailty",sep="")]=eval(parse(text=paste("cat",s[q,2],sep="_")))
+
+### for ERBB2 ####
+for(l in 1:length(eval(parse(text=paste("xcuts",s[q,1],sep="_")))))
+{
+  assign(paste("cat",s[q,1],sep="_"),ifelse(new_data[,colnames(new_data)==s[q,1]] < eval(parse(text=paste("xcuts",s[q,1],sep="_")))[l],0,1))
+  new_data[,colnames(new_data)==paste(s[q,1],"frailty",sep="")]=eval(parse(text=paste("cat",s[q,1],sep="_")))
+  coxmodel <- coxph(Surv(time, status==1)~ age + tstage + nstage + mstage + HER2frailty+ERfrailty
+                    +PRfrailty+ERBB2frailty, data = new_data)
+  d=data.frame(s[q,1],l,eval(parse(text=paste("xcuts",s[q,1],sep="_")))[l], as.numeric(summary(coxmodel)[["coefficients"]][,"Pr(>|z|)"][paste(s[q,1],"frailty",sep="")]))
+  coxmod4=rbind(coxmod4,d)
+} 
+colnames(coxmod4)=c("gene_name","cutpoint","cutoffvalue","p_value")
+#cat_ERBB2=ifelse(new_data$ERBB2<coxER[which.min(coxERBB2$p_value),]$cutoffvalue,0,1)
+
+gene_p=c(s[q,1],s[q,2],s[q,3],s[q,4],coxmod4[which.min(coxmod4$p_value),]$cutoffvalue,coxmod3[which.min(coxmod3$p_value),]$cutoffvalue,
+          coxmod2[which.min(coxmod2$p_value),]$cutoffvalue,coxmod1[which.min(coxmod1$p_value),]$cutoffvalue)
+final_p=rbind(final_p,gene_p)
+}
+colnames(final_p)<-c("gene1","gene2","gene3","gene4","cutoff1","cutoff2","cutoff3","cutoff4")
+
+#### frailty for different parts below and above threshold ####
+data_new=read.csv("cutoff_50.csv",header=TRUE)
+output=data.frame()
+for(i in 1:dim(final_p)[1])
+{
+  result=data.frame(1)
+  for(j in 1:4)
+  {
+    print(i)
+    new_data1=new_data[new_data[,colnames(new_data)==data_new[i,j]]<data_new[i,j+4],]
+    new_data2=new_data[new_data[,colnames(new_data)==data_new[i,j]]>data_new[i,j+4],]
+    coxmodel1=coxph(Surv(time, status==1)~ age + tstage + nstage + mstage +frailty(ID,dist="gaussian"), data = new_data1)
+    coxmodel2=coxph(Surv(time, status==1)~ age + tstage + nstage + mstage +frailty(ID,dist="gaussian"), data = new_data2)
+    result1=data.frame(data_new[i,j],coxmodel1$history$f$theta,coxmodel2$history$f$theta)    
+    result=cbind(result,result1)
+  }
+  output=rbind(output,result)
+}
+output=output[,-1]
+colnames(output)=c("gene1","lower_fvar","upper_fvar","gene2","lower_fvar","upper_fvar",
+                   "gene3","lower_fvar","upper_fvar","gene4","lower_fvar","upper_fvar")
+
+
+
+
+
+
