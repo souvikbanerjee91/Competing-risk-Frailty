@@ -42,11 +42,11 @@ for(s in 10:(length(xcuts)-10))
 tmat_new <- transMat(x=list(c(2, 3), c(), c()),
                      names=c("Censored", "DM","CR"))
 covs_new=c("age", "tstage", "nstage","mstage","HER2frailty")
-longData_new <- msprep(data = new_data, trans = tmat_new,
+longData <- msprep(data = new_data, trans = tmat_new,
                        time = c(NA, "time","time"),
                        status = c(NA, "DM", "CR"),
                        keep = covs_new)
-expandedData_new <- expand.covs(longData_new, covs_new, longnames=FALSE)
+expandData <- expand.covs(longData, covs_new, longnames=FALSE)
 
 em <- function(lognu = c(0,0,0), last=FALSE) {
   print(exp(lognu))
@@ -59,20 +59,20 @@ em <- function(lognu = c(0,0,0), last=FALSE) {
   log.stand2 <- log(stand2)
   HER2frailty <- unique(new_data$HER2frailty)
   K <- length(HER2frailty)
-  X <- as.matrix(expandedData_new[expandedData_new$trans==1,
+  X <- as.matrix(expandData[expandData$trans==1,
                                   c("age.1", "tstage1.1","tstage2.1","tstage3.1",
                                     "nstage1.1","nstage2.1","nstage3.1","nstage4.1",
                                     "mstage1.1","mstage2.1","mstage3.1")]) 
-  eventtimes1 <- sort(unique(longData_new$time[longData_new$trans == 1 &
-                                                 longData_new$status == 1]))
-  eventtimes2 <- sort(unique(longData_new$time[longData_new$trans == 2 &
-                                                 longData_new$status == 1]))
+  eventtimes1 <- sort(unique(longData$time[longData$trans == 1 &
+                                                 longData$status == 1]))
+  eventtimes2 <- sort(unique(longData$time[longData$trans == 2 &
+                                                 longData$status == 1]))
   # set up constant values for each hospital
   datak1 <- datak2<- dk1 <- dk2 <-
     l <- m <- a1 <- a2 <- a3 <- wh1 <-
     wh2 <- xk<- tk1 <- tk2 <- vector('list', K)
   for(i in 1:K){
-    datak <- longData_new[longData_new$HER2frailty == HER2frailty[i],]
+    datak <- longData[longData$HER2frailty == HER2frailty[i],]
     datak1[[i]] <- datak[datak$trans == 1,]
     datak2[[i]] <- datak[datak$trans == 2,]
     dk1[[i]] <- sum(datak1[[i]]$status)
@@ -100,15 +100,15 @@ em <- function(lognu = c(0,0,0), last=FALSE) {
     Zk0 <- exp(rnorm(K, lognu[1]-0.5,1))
     Zk1 <- exp(rnorm(K, lognu[2]-0.5,1))
     Zk2 <- exp(rnorm(K, lognu[3]-0.5,1))
-    longData_new$zk0 <- Zk0[match(longData_new$HER2frailty, HER2frailty)]
-    longData_new$zk1 <- Zk1[match(longData_new$HER2frailty, HER2frailty)]
-    longData_new$zk2 <- Zk2[match(longData_new$HER2frailty, HER2frailty)]
+    longData$zk0 <- Zk0[match(longData$HER2frailty, HER2frailty)]
+    longData$zk1 <- Zk1[match(longData$HER2frailty, HER2frailty)]
+    longData$zk2 <- Zk2[match(longData$HER2frailty, HER2frailty)]
     m.cause1 <- coxph(Surv(time, status)~ age + tstage + nstage + mstage+
                         offset(log((zk0 + zk1)*stand1)),
-                      data = longData_new, subset = (trans == 1))
+                      data = longData, subset = (trans == 1))
     m.cause2 <- coxph(Surv(time, status)~ age + tstage + nstage + mstage+
                         offset(log((zk0 + zk2)*stand2)),
-                      data = longData_new, subset = (trans == 2))
+                      data = longData, subset = (trans == 2))
     Lambda1 <- basehaz(m.cause1, centered=FALSE)
     Lambda1 <- Lambda1[!duplicated(Lambda1$hazard),]
     Lambda1 <- Lambda1[Lambda1$hazard != 0,]
@@ -143,10 +143,10 @@ em <- function(lognu = c(0,0,0), last=FALSE) {
         maxtmp <- max(tmp)
         tmp <- tmp - maxtmp
         mat <- exp(tmp)
-        clm <- mat/sum(mat)
-        Zk0[i] <- sum(clm*(a3[[i]]/b3))
-        Zk1[i] <- sum(clm*(a1[[i]]/b1))
-        Zk2[i] <- sum(clm*(a2[[i]]/b2))
+        hrat <- mat/sum(mat)
+        Zk0[i] <- sum(hrat*(a3[[i]]/b3))
+        Zk1[i] <- sum(hrat*(a1[[i]]/b1))
+        Zk2[i] <- sum(hrat*(a2[[i]]/b2))
         # likelihood contribution of hospital k ####
         obs[i] <- (dk1[[i]]*log.stand1 + dk2[[i]]*log.stand2 -
                      lgamma(nu0) - lgamma(nu1) - lgamma(nu2)) +
@@ -160,15 +160,15 @@ em <- function(lognu = c(0,0,0), last=FALSE) {
       if(abs(delta) < 1e-4) break
       loglik.old <- loglik
       # M-step ####
-      longData_new$zk0 <- Zk0[match(longData_new$HER2frailty, HER2frailty)]
-      longData_new$zk1 <- Zk1[match(longData_new$HER2frailty, HER2frailty)]
-      longData_new$zk2 <- Zk2[match(longData_new$HER2frailty, HER2frailty)]
+      longData$zk0 <- Zk0[match(longData$HER2frailty, HER2frailty)]
+      longData$zk1 <- Zk1[match(longData$HER2frailty, HER2frailty)]
+      longData$zk2 <- Zk2[match(longData$HER2frailty, HER2frailty)]
       m.cause1 <- coxph(Surv(time, status)~ age + tstage + nstage + mstage+
                           offset(log((zk0 + zk1)*stand1)),
-                        data = longData_new, subset = (trans == 1))
+                        data = longData, subset = (trans == 1))
       m.cause2 <- coxph(Surv(time, status)~ age + tstage + nstage +mstage+
                           offset(log((zk0 + zk2)*stand2)),
-                        data = longData_new, subset = (trans == 2))
+                        data = longData, subset = (trans == 2))
       Lambda1 <- basehaz(m.cause1, centered = FALSE)
       Lambda1 <- Lambda1[!duplicated(Lambda1$hazard),]
       Lambda1 <- Lambda1[Lambda1$hazard != 0,]
@@ -186,7 +186,7 @@ em <- function(lognu = c(0,0,0), last=FALSE) {
   }
   m.index <- which.max(obslik)
   ifelse(last == FALSE, return(obslik[m.index]),
-         return(c(models[[m.index]], longData_new)))
+         return(c(models[[m.index]], longData)))
 }
 
 param <- function(lognu){
